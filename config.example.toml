@@ -1,0 +1,4 @@
+[[targets]]
+id = "example-course"
+url = "https://example.com/course"
+intent = "Notify me about recruitment or registration changes."
