@@ -5,9 +5,12 @@ import difflib
 import json
 import os
 import re
+import smtplib
+import ssl
 import sys
 import tempfile
 import tomllib
+from email.message import EmailMessage
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -201,6 +204,49 @@ def classify_change(target_id, url, intent, diff):
     return decision.strip()
 
 
+def send_notification(target_id, url, decision, diff):
+    settings = {
+        name: os.environ.get(name, "").strip()
+        for name in (
+            "SMTP_HOST",
+            "SMTP_USERNAME",
+            "SMTP_PASSWORD",
+            "SMTP_FROM",
+            "SMTP_TO",
+        )
+    }
+    missing = [name for name, value in settings.items() if not value]
+    if missing:
+        raise ValueError(f"missing email settings: {', '.join(missing)}")
+    try:
+        port = int(os.environ.get("SMTP_PORT", "587"))
+    except ValueError as exc:
+        raise ValueError("SMTP_PORT must be a number") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("SMTP_PORT must be between 1 and 65535")
+
+    reason = {
+        "NOTIFY": "The change appears relevant to your intent.",
+        "REVIEW": "The change may be relevant and needs your review.",
+    }[decision]
+    change = diff[:4000]
+    if len(diff) > 4000:
+        change += "\n[Diff truncated; open the page for more context.]"
+    message = EmailMessage()
+    message["Subject"] = f"[PageWatch] {decision}: {target_id}"
+    message["From"] = settings["SMTP_FROM"]
+    message["To"] = settings["SMTP_TO"]
+    message.set_content(
+        f"Target: {target_id}\nURL: {url}\nDecision: {decision}\n"
+        f"Reason: {reason}\n\nChange:\n{change}"
+    )
+
+    with smtplib.SMTP(settings["SMTP_HOST"], port, timeout=15) as server:
+        server.starttls(context=ssl.create_default_context())
+        server.login(settings["SMTP_USERNAME"], settings["SMTP_PASSWORD"])
+        server.send_message(message)
+
+
 def save_baseline(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
@@ -236,11 +282,10 @@ def run(config_path, state_dir):
                     )
                 )
                 decision = classify_change(target_id, url, intent, diff)
-                if decision == "IGNORE":
-                    save_baseline(state_path, current)
+                if decision in {"NOTIFY", "REVIEW"}:
+                    send_notification(target_id, url, decision, diff)
+                save_baseline(state_path, current)
                 print(f"{target_id}: {decision}")
-                if decision != "IGNORE":
-                    sys.stdout.write(diff)
         except Exception as exc:
             failed = True
             print(f"{target_id}: {exc}", file=sys.stderr)

@@ -28,11 +28,13 @@ class CoreWatcherTests(unittest.TestCase):
         with (
             patch.object(pagewatch, "fetch_page", return_value="<p>Places open</p>"),
             patch.object(pagewatch, "classify_change") as classify,
+            patch.object(pagewatch, "send_notification") as notify,
             contextlib.redirect_stdout(output),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
         classify.assert_not_called()
+        notify.assert_not_called()
         baseline = self.state_dir / "course.txt"
         self.assertEqual(baseline.read_text(encoding="utf-8"), "Places open\n")
         self.assertEqual(output.getvalue(), "course: baseline saved\n")
@@ -43,6 +45,7 @@ class CoreWatcherTests(unittest.TestCase):
             patch.object(
                 pagewatch, "classify_change", return_value="NOTIFY"
             ) as classify,
+            patch.object(pagewatch, "send_notification") as notify,
             contextlib.redirect_stdout(output),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
@@ -52,29 +55,69 @@ class CoreWatcherTests(unittest.TestCase):
             ("course", "https://example.com/course", "Watch recruitment"),
         )
         self.assertIn("-Places open\n+Places closed\n", classify.call_args.args[3])
+        self.assertEqual(
+            notify.call_args.args[:3],
+            ("course", "https://example.com/course", "NOTIFY"),
+        )
+        self.assertEqual(notify.call_args.args[3], classify.call_args.args[3])
         self.assertIn("course: NOTIFY", output.getvalue())
-        self.assertIn("-Places open\n+Places closed\n", output.getvalue())
-        self.assertEqual(baseline.read_text(encoding="utf-8"), "Places open\n")
+        self.assertEqual(baseline.read_text(encoding="utf-8"), "Places closed\n")
 
-    def test_ignore_updates_state_and_review_keeps_previous_state(self):
+    def test_review_and_ignore_update_state(self):
         self.state_dir.mkdir()
         baseline = self.state_dir / "course.txt"
         baseline.write_text("Old\n", encoding="utf-8")
         with (
             patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
             patch.object(pagewatch, "classify_change", return_value="REVIEW"),
+            patch.object(pagewatch, "send_notification") as notify,
             contextlib.redirect_stdout(StringIO()),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
-        self.assertEqual(baseline.read_text(encoding="utf-8"), "Old\n")
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.args[2], "REVIEW")
+        self.assertEqual(baseline.read_text(encoding="utf-8"), "New\n")
 
         with (
-            patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
+            patch.object(pagewatch, "fetch_page", return_value="<p>Newer</p>"),
             patch.object(pagewatch, "classify_change", return_value="IGNORE"),
+            patch.object(pagewatch, "send_notification") as notify,
             contextlib.redirect_stdout(StringIO()),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
-        self.assertEqual(baseline.read_text(encoding="utf-8"), "New\n")
+        notify.assert_not_called()
+        self.assertEqual(baseline.read_text(encoding="utf-8"), "Newer\n")
+
+    def test_notification_failure_preserves_state_and_other_target_runs(self):
+        self.config.write_text(
+            '[[targets]]\nid = "first"\nurl = "https://example.com/first"\n'
+            'intent = "Watch recruitment"\n'
+            '[[targets]]\nid = "second"\nurl = "https://example.com/second"\n'
+            'intent = "Watch recruitment"\n',
+            encoding="utf-8",
+        )
+        self.state_dir.mkdir()
+        (self.state_dir / "first.txt").write_text("Old\n", encoding="utf-8")
+        (self.state_dir / "second.txt").write_text("Old\n", encoding="utf-8")
+        with (
+            patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
+            patch.object(pagewatch, "classify_change", return_value="NOTIFY"),
+            patch.object(
+                pagewatch,
+                "send_notification",
+                side_effect=[OSError("SMTP failed"), None],
+            ) as notify,
+            contextlib.redirect_stdout(StringIO()),
+            contextlib.redirect_stderr(StringIO()),
+        ):
+            self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
+        self.assertEqual(notify.call_count, 2)
+        self.assertEqual(
+            (self.state_dir / "first.txt").read_text(encoding="utf-8"), "Old\n"
+        )
+        self.assertEqual(
+            (self.state_dir / "second.txt").read_text(encoding="utf-8"), "New\n"
+        )
 
     def test_classification_failure_preserves_state(self):
         self.state_dir.mkdir()
@@ -247,6 +290,41 @@ class CoreWatcherTests(unittest.TestCase):
                     "course", "https://example.com", "Watch recruitment", "+New"
                 )
         open_url.assert_not_called()
+
+    def test_notification_uses_starttls_and_contains_change(self):
+        settings = {
+            "SMTP_HOST": "smtp.example.com",
+            "SMTP_USERNAME": "account@example.com",
+            "SMTP_PASSWORD": "test-secret",
+            "SMTP_FROM": "watcher@example.com",
+            "SMTP_TO": "reader@example.com",
+        }
+        with (
+            patch.dict(pagewatch.os.environ, settings, clear=True),
+            patch.object(pagewatch.smtplib, "SMTP") as smtp,
+        ):
+            pagewatch.send_notification(
+                "course",
+                "https://example.com/course",
+                "NOTIFY",
+                "+New places available\n" + "x" * 5000,
+            )
+        smtp.assert_called_once_with("smtp.example.com", 587, timeout=15)
+        server = smtp.return_value.__enter__.return_value
+        self.assertIsInstance(
+            server.starttls.call_args.kwargs["context"], pagewatch.ssl.SSLContext
+        )
+        server.login.assert_called_once_with("account@example.com", "test-secret")
+        message = server.send_message.call_args.args[0]
+        self.assertEqual(message["Subject"], "[PageWatch] NOTIFY: course")
+        self.assertEqual(message["From"], "watcher@example.com")
+        self.assertEqual(message["To"], "reader@example.com")
+        body = message.get_content()
+        self.assertIn("URL: https://example.com/course", body)
+        self.assertIn("Decision: NOTIFY", body)
+        self.assertIn("Reason: The change appears relevant", body)
+        self.assertIn("+New places available", body)
+        self.assertIn("[Diff truncated; open the page", body)
 
     def test_main_loads_local_env_without_overriding_shell(self):
         (self.root / ".env").write_text(

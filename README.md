@@ -1,12 +1,13 @@
 # PageWatch AI Lite
 
 PageWatch AI Lite watches a few web pages for changes. The first run saves a
-baseline; later runs ask AI whether a change matters. Email notifications are
-not available yet.
+baseline; later runs ask AI whether a change matters and email you about
+relevant or uncertain changes.
 
 For classification, put a [Console Chat Completions model](https://opencode.ai/v2/docs/console/inference/)
 and a Console service account key in a local `.env` file. Shell environment
-variables take precedence.
+variables take precedence. Set `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`,
+`SMTP_FROM`, and `SMTP_TO` there too. Email uses STARTTLS on port 587 by default.
 
 ## Run on Ubuntu
 
@@ -24,5 +25,5 @@ python pagewatch.py
 ```
 
 Run `python pagewatch.py` again whenever you want to check for changes.
-`IGNORE` saves the new baseline; `NOTIFY` and `REVIEW` print the diff and keep
-the previous baseline until email delivery is implemented.
+`IGNORE` saves the new baseline. `NOTIFY` and `REVIEW` send an email, then save
+the new baseline. If sending fails, the previous baseline stays in place.
