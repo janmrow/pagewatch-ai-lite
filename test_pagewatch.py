@@ -1,4 +1,5 @@
 import contextlib
+import json
 import tempfile
 import unittest
 from email.message import Message
@@ -16,7 +17,8 @@ class CoreWatcherTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.config = self.root / "config.toml"
         self.config.write_text(
-            '[[targets]]\nid = "course"\nurl = "https://example.com/course"\n',
+            '[[targets]]\nid = "course"\nurl = "https://example.com/course"\n'
+            'intent = "Watch recruitment"\n',
             encoding="utf-8",
         )
         self.state_dir = self.root / ".state"
@@ -25,10 +27,12 @@ class CoreWatcherTests(unittest.TestCase):
         output = StringIO()
         with (
             patch.object(pagewatch, "fetch_page", return_value="<p>Places open</p>"),
+            patch.object(pagewatch, "classify_change") as classify,
             contextlib.redirect_stdout(output),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
+        classify.assert_not_called()
         baseline = self.state_dir / "course.txt"
         self.assertEqual(baseline.read_text(encoding="utf-8"), "Places open\n")
         self.assertEqual(output.getvalue(), "course: baseline saved\n")
@@ -36,16 +40,62 @@ class CoreWatcherTests(unittest.TestCase):
         output = StringIO()
         with (
             patch.object(pagewatch, "fetch_page", return_value="<p>Places closed</p>"),
+            patch.object(
+                pagewatch, "classify_change", return_value="NOTIFY"
+            ) as classify,
             contextlib.redirect_stdout(output),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
+        self.assertEqual(classify.call_count, 1)
+        self.assertEqual(
+            classify.call_args.args[:3],
+            ("course", "https://example.com/course", "Watch recruitment"),
+        )
+        self.assertIn("-Places open\n+Places closed\n", classify.call_args.args[3])
+        self.assertIn("course: NOTIFY", output.getvalue())
         self.assertIn("-Places open\n+Places closed\n", output.getvalue())
         self.assertEqual(baseline.read_text(encoding="utf-8"), "Places open\n")
+
+    def test_ignore_updates_state_and_review_keeps_previous_state(self):
+        self.state_dir.mkdir()
+        baseline = self.state_dir / "course.txt"
+        baseline.write_text("Old\n", encoding="utf-8")
+        with (
+            patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
+            patch.object(pagewatch, "classify_change", return_value="REVIEW"),
+            contextlib.redirect_stdout(StringIO()),
+        ):
+            self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
+        self.assertEqual(baseline.read_text(encoding="utf-8"), "Old\n")
+
+        with (
+            patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
+            patch.object(pagewatch, "classify_change", return_value="IGNORE"),
+            contextlib.redirect_stdout(StringIO()),
+        ):
+            self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
+        self.assertEqual(baseline.read_text(encoding="utf-8"), "New\n")
+
+    def test_classification_failure_preserves_state(self):
+        self.state_dir.mkdir()
+        baseline = self.state_dir / "course.txt"
+        baseline.write_text("Old\n", encoding="utf-8")
+        with (
+            patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
+            patch.object(
+                pagewatch, "classify_change", side_effect=ValueError("bad reply")
+            ),
+            contextlib.redirect_stderr(StringIO()),
+        ):
+            self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
+        self.assertEqual(baseline.read_text(encoding="utf-8"), "Old\n")
 
     def test_target_failure_does_not_block_another_or_change_its_state(self):
         self.config.write_text(
             '[[targets]]\nid = "broken"\nurl = "https://example.com/broken"\n'
-            '[[targets]]\nid = "working"\nurl = "https://example.com/working"\n',
+            'intent = "Watch recruitment"\n'
+            '[[targets]]\nid = "working"\nurl = "https://example.com/working"\n'
+            'intent = "Watch recruitment"\n',
             encoding="utf-8",
         )
         self.state_dir.mkdir()
@@ -107,6 +157,114 @@ class CoreWatcherTests(unittest.TestCase):
         with patch.object(pagewatch, "urlopen", return_value=response) as open_url:
             self.assertEqual(pagewatch.fetch_page("https://example.com"), "Zażółć")
         self.assertEqual(open_url.call_args.kwargs["timeout"], 15)
+
+    def test_console_request_and_strict_decision(self):
+        response = BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": "  IGNORE\n"},
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+        )
+        with (
+            patch.dict(
+                pagewatch.os.environ,
+                {
+                    "OPENCODE_MODEL": "glm-5.1",
+                    "OPENCODE_API_KEY": "test-secret",
+                },
+            ),
+            patch.object(pagewatch, "urlopen", return_value=response) as open_url,
+        ):
+            decision = pagewatch.classify_change(
+                "course",
+                "https://example.com/course",
+                "Watch recruitment",
+                "+Places open",
+            )
+        self.assertEqual(decision, "IGNORE")
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, pagewatch.CONSOLE_URL)
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-secret")
+        self.assertEqual(request.get_header("User-agent"), "pagewatch-ai-lite/0.1")
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+        self.assertEqual(open_url.call_args.kwargs["timeout"], 30)
+        payload = json.loads(request.data)
+        self.assertEqual(payload["model"], "glm-5.1")
+        self.assertEqual(payload["max_tokens"], 1024)
+        self.assertEqual(payload["messages"][0]["role"], "system")
+        self.assertIn("untrusted", payload["messages"][0]["content"])
+        context = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(context["target_id"], "course")
+        self.assertEqual(context["url"], "https://example.com/course")
+        self.assertEqual(context["intent"], "Watch recruitment")
+        self.assertEqual(context["untrusted_diff"], "+Places open")
+        self.assertNotIn("test-secret", request.data.decode("utf-8"))
+
+    def test_console_rejects_invalid_decision_and_incomplete_reply(self):
+        for content, finish_reason in [("IGNORE extra", "stop"), ("IGNORE", "length")]:
+            response = BytesIO(
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": finish_reason,
+                                "message": {"content": content},
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+            )
+            with (
+                patch.dict(
+                    pagewatch.os.environ,
+                    {
+                        "OPENCODE_MODEL": "glm-5.1",
+                        "OPENCODE_API_KEY": "test-secret",
+                    },
+                ),
+                patch.object(pagewatch, "urlopen", return_value=response),
+            ):
+                with self.assertRaises(ValueError):
+                    pagewatch.classify_change(
+                        "course", "https://example.com", "Watch recruitment", "+New"
+                    )
+
+    def test_console_requires_credentials_before_request(self):
+        with (
+            patch.dict(pagewatch.os.environ, {"OPENCODE_MODEL": "glm-5.1"}, clear=True),
+            patch.object(pagewatch, "urlopen") as open_url,
+        ):
+            with self.assertRaisesRegex(ValueError, "OPENCODE_API_KEY"):
+                pagewatch.classify_change(
+                    "course", "https://example.com", "Watch recruitment", "+New"
+                )
+        open_url.assert_not_called()
+
+    def test_main_loads_local_env_without_overriding_shell(self):
+        (self.root / ".env").write_text(
+            "OPENCODE_MODEL=file-model\nOPENCODE_API_KEY=file-key\n",
+            encoding="utf-8",
+        )
+        with (
+            patch.object(pagewatch, "__file__", str(self.root / "pagewatch.py")),
+            patch.object(pagewatch.sys, "argv", ["pagewatch.py"]),
+            patch.object(pagewatch, "run", return_value=0) as run,
+            patch.dict(
+                pagewatch.os.environ, {"OPENCODE_MODEL": "shell-model"}, clear=True
+            ),
+        ):
+            self.assertEqual(pagewatch.main(), 0)
+            self.assertEqual(pagewatch.os.environ["OPENCODE_MODEL"], "shell-model")
+            self.assertEqual(pagewatch.os.environ["OPENCODE_API_KEY"], "file-key")
+        run.assert_called_once_with(Path("config.toml"), Path(".state"))
 
     def test_failed_atomic_replace_preserves_previous_state(self):
         self.state_dir.mkdir()
