@@ -1,0 +1,38 @@
+[[targets]]
+id = "information-security"
+url = "https://www.ue.katowice.pl/studia-podyplomowe/kierunki-studiow-podyplomowych/bezpieczenstwo-informacji-i-ochrona-danych/informacje-o-kierunku.html"
+intent = """
+Program: Bezpieczeństwo informacji i ochrona danych.
+Notify me about changes that may create or materially change an opportunity to enroll: opening, reopening, or extending recruitment; an additional group or round; newly available places; reopened registration; or a relevant change in recruitment status or deadline.
+Ignore ordinary content edits, marketing, staff, curriculum, timetable, pricing, and other administrative updates unless they directly affect enrollment.
+If a change may affect enrollment but its significance is unclear, return REVIEW.
+"""
+
+[[targets]]
+id = "internal-audit-online"
+url = "https://www.ue.katowice.pl/studia-podyplomowe/kierunki-studiow-podyplomowych/audyt-i-kontrola-wewnetrzna-w-biznesie-i-administracji-publicznej-online/informacje-o-kierunku.html"
+intent = """
+Program: Audyt i kontrola wewnętrzna w biznesie i administracji publicznej (online).
+Notify me about changes that may create or materially change an opportunity to enroll: opening, reopening, or extending recruitment; an additional group or round; newly available places; reopened registration; or a relevant change in recruitment status or deadline.
+Ignore ordinary content edits, marketing, staff, curriculum, timetable, pricing, and other administrative updates unless they directly affect enrollment.
+If a change may affect enrollment but its significance is unclear, return REVIEW.
+"""
+
+[[targets]]
+id = "ai-quality-manager"
+url = "https://www.ue.katowice.pl/studia-podyplomowe/kierunki-studiow-podyplomowych/ai-quality-menedzer/informacje-o-kierunku.html"
+intent = """
+Program: AI & Quality Menedżer.
+Notify me about changes that may create or materially change an opportunity to enroll: opening, reopening, or extending recruitment; an additional group or round; newly available places; reopened registration; or a relevant change in recruitment status or deadline.
+Ignore ordinary content edits, marketing, staff, curriculum, timetable, pricing, and other administrative updates unless they directly affect enrollment.
+If a change may affect enrollment but its significance is unclear, return REVIEW.
+"""
+
+[[targets]]
+id = "postgraduate-overview"
+url = "https://www.ue.katowice.pl/studia-podyplomowe.html"
+intent = """
+I am interested only in recruitment-related changes concerning Bezpieczeństwo informacji i ochrona danych, Audyt i kontrola wewnętrzna w biznesie i administracji publicznej (online), and AI & Quality Menedżer.
+Notify me about openings, extensions, additional groups or rounds, newly available places, reopened registration, or status and deadline changes that may allow enrollment in these programs.
+Ignore changes about other programs and ordinary marketing or administrative edits. If the effect on enrollment in one of these programs is unclear, return REVIEW.
+"""
