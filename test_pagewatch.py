@@ -99,6 +99,7 @@ class CoreWatcherTests(unittest.TestCase):
         self.state_dir.mkdir()
         (self.state_dir / "first.txt").write_text("Old\n", encoding="utf-8")
         (self.state_dir / "second.txt").write_text("Old\n", encoding="utf-8")
+        error = StringIO()
         with (
             patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
             patch.object(pagewatch, "classify_change", return_value="NOTIFY"),
@@ -108,10 +109,11 @@ class CoreWatcherTests(unittest.TestCase):
                 side_effect=[OSError("SMTP failed"), None],
             ) as notify,
             contextlib.redirect_stdout(StringIO()),
-            contextlib.redirect_stderr(StringIO()),
+            contextlib.redirect_stderr(error),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
         self.assertEqual(notify.call_count, 2)
+        self.assertIn("first [email]: OSError: SMTP failed", error.getvalue())
         self.assertEqual(
             (self.state_dir / "first.txt").read_text(encoding="utf-8"), "Old\n"
         )
@@ -123,15 +125,19 @@ class CoreWatcherTests(unittest.TestCase):
         self.state_dir.mkdir()
         baseline = self.state_dir / "course.txt"
         baseline.write_text("Old\n", encoding="utf-8")
-        with (
-            patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
-            patch.object(
-                pagewatch, "classify_change", side_effect=ValueError("bad reply")
-            ),
-            contextlib.redirect_stderr(StringIO()),
-        ):
-            self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
-        self.assertEqual(baseline.read_text(encoding="utf-8"), "Old\n")
+        for failure in (ValueError("bad reply"), TimeoutError("LLM timed out")):
+            with self.subTest(failure=type(failure).__name__):
+                error = StringIO()
+                with (
+                    patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
+                    patch.object(pagewatch, "classify_change", side_effect=failure),
+                    contextlib.redirect_stderr(error),
+                ):
+                    self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
+                self.assertIn(
+                    f"course [classify]: {type(failure).__name__}", error.getvalue()
+                )
+                self.assertEqual(baseline.read_text(encoding="utf-8"), "Old\n")
 
     def test_target_failure_does_not_block_another_or_change_its_state(self):
         self.config.write_text(
@@ -146,15 +152,17 @@ class CoreWatcherTests(unittest.TestCase):
 
         def fetch(url):
             if url.endswith("broken"):
-                raise OSError("fetch failed")
+                raise TimeoutError("fetch timed out")
             return "<p>Working</p>"
 
+        error = StringIO()
         with (
             patch.object(pagewatch, "fetch_page", side_effect=fetch),
             contextlib.redirect_stdout(StringIO()),
-            contextlib.redirect_stderr(StringIO()),
+            contextlib.redirect_stderr(error),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
+        self.assertIn("broken [fetch]: TimeoutError: fetch timed out", error.getvalue())
         self.assertEqual(
             (self.state_dir / "broken.txt").read_text(encoding="utf-8"), "Known good\n"
         )
@@ -280,6 +288,18 @@ class CoreWatcherTests(unittest.TestCase):
                         "course", "https://example.com", "Watch recruitment", "+New"
                     )
 
+        with (
+            patch.dict(
+                pagewatch.os.environ,
+                {"OPENCODE_MODEL": "glm-5.1", "OPENCODE_API_KEY": "test-secret"},
+            ),
+            patch.object(pagewatch, "urlopen", return_value=BytesIO(b"not JSON")),
+        ):
+            with self.assertRaises(json.JSONDecodeError):
+                pagewatch.classify_change(
+                    "course", "https://example.com", "Watch recruitment", "+New"
+                )
+
     def test_console_requires_credentials_before_request(self):
         with (
             patch.dict(pagewatch.os.environ, {"OPENCODE_MODEL": "glm-5.1"}, clear=True),
@@ -353,6 +373,26 @@ class CoreWatcherTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(OSError, "replace failed"):
                 pagewatch.save_baseline(baseline, "New text\n")
+        self.assertEqual(baseline.read_text(encoding="utf-8"), "Known good\n")
+        self.assertEqual(list(self.state_dir.iterdir()), [baseline])
+
+    def test_failed_state_save_after_notification_keeps_previous_state(self):
+        self.state_dir.mkdir()
+        baseline = self.state_dir / "course.txt"
+        baseline.write_text("Known good\n", encoding="utf-8")
+        error = StringIO()
+        with (
+            patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
+            patch.object(pagewatch, "classify_change", return_value="NOTIFY"),
+            patch.object(pagewatch, "send_notification") as notify,
+            patch.object(
+                pagewatch.os, "replace", side_effect=OSError("replace failed")
+            ),
+            contextlib.redirect_stderr(error),
+        ):
+            self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
+        notify.assert_called_once()
+        self.assertIn("course [save state]: OSError: replace failed", error.getvalue())
         self.assertEqual(baseline.read_text(encoding="utf-8"), "Known good\n")
         self.assertEqual(list(self.state_dir.iterdir()), [baseline])
 

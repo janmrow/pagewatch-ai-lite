@@ -263,16 +263,22 @@ def run(config_path, state_dir):
     targets = load_targets(config_path)
     failed = False
     for target_id, url, intent in targets:
+        stage = "fetch"
         try:
-            current = normalize_text(fetch_page(url))
+            page = fetch_page(url)
+            stage = "normalize"
+            current = normalize_text(page)
             state_path = state_dir / f"{target_id}.txt"
+            stage = "read state"
             try:
                 previous = state_path.read_text(encoding="utf-8")
             except FileNotFoundError:
+                stage = "save baseline"
                 save_baseline(state_path, current)
                 print(f"{target_id}: baseline saved")
                 continue
             if current != previous:
+                stage = "diff"
                 diff = "".join(
                     difflib.unified_diff(
                         previous.splitlines(keepends=True),
@@ -281,14 +287,19 @@ def run(config_path, state_dir):
                         tofile=f"{target_id}: current",
                     )
                 )
+                stage = "classify"
                 decision = classify_change(target_id, url, intent, diff)
                 if decision in {"NOTIFY", "REVIEW"}:
+                    stage = "email"
                     send_notification(target_id, url, decision, diff)
+                stage = "save state"
                 save_baseline(state_path, current)
                 print(f"{target_id}: {decision}")
         except Exception as exc:
             failed = True
-            print(f"{target_id}: {exc}", file=sys.stderr)
+            print(
+                f"{target_id} [{stage}]: {type(exc).__name__}: {exc}", file=sys.stderr
+            )
     return 1 if failed else 0
 
 
@@ -297,8 +308,8 @@ def main():
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
     parser.add_argument("--state-dir", type=Path, default=Path(".state"))
     args = parser.parse_args()
-    load_dotenv(Path(__file__).with_name(".env"), override=False)
     try:
+        load_dotenv(Path(__file__).with_name(".env"), override=False)
         return run(args.config, args.state_dir)
     except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
         print(f"configuration: {exc}", file=sys.stderr)
