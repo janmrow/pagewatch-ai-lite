@@ -30,7 +30,7 @@ If a change may affect enrollment but its significance is unclear, return REVIEW
 
 [[targets]]
 id = "postgraduate-overview"
-url = "https://www.ue.katowice.pl/studia-podyplomowe.html"
+url = "https://www.ue.katowice.pl/studia-podyplomowe/kandydat/rekrutacja.html"
 intent = """
 I am interested only in recruitment-related changes concerning Bezpieczeństwo informacji i ochrona danych, Audyt i kontrola wewnętrzna w biznesie i administracji publicznej (online), and AI & Quality Menedżer.
 Notify me about openings, extensions, additional groups or rounds, newly available places, reopened registration, or status and deadline changes that may allow enrollment in these programs.
