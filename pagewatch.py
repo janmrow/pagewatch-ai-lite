@@ -44,6 +44,7 @@ BLOCK_TAGS = {
 }
 SKIP_TAGS = {"script", "style", "noscript", "svg", "template"}
 MAX_PAGE_BYTES = 5_000_000
+MAX_CLASSIFICATION_DIFF_BYTES = 512 * 1024
 CONSOLE_URL = "https://opencode.ai/inference/openai/v1/chat/completions"
 DECISIONS = {"NOTIFY", "IGNORE", "REVIEW"}
 
@@ -204,7 +205,7 @@ def classify_change(target_id, url, intent, diff):
     return decision.strip()
 
 
-def send_notification(target_id, url, decision, diff):
+def send_notification(target_id, url, decision, diff, *, reason=None, oversized=False):
     settings = {
         name: os.environ.get(name, "").strip()
         for name in (
@@ -225,12 +226,28 @@ def send_notification(target_id, url, decision, diff):
     if not 1 <= port <= 65535:
         raise ValueError("SMTP_PORT must be between 1 and 65535")
 
-    reason = {
-        "NOTIFY": "The change appears relevant to your intent.",
-        "REVIEW": "The change may be relevant and needs your review.",
-    }[decision]
-    change = diff[:4000]
-    if len(diff) > 4000:
+    if reason is None:
+        reason = {
+            "NOTIFY": "The change appears relevant to your intent.",
+            "REVIEW": "The change may be relevant and needs your review.",
+        }[decision]
+    if oversized:
+        removed = added = None
+        for line in diff.splitlines():
+            if line.startswith("-") and not line.startswith("--- ") and removed is None:
+                removed = line[1:]
+            elif line.startswith("+") and not line.startswith("+++ ") and added is None:
+                added = line[1:]
+            if removed is not None and added is not None:
+                break
+        change = (
+            f"Removed: {(removed or '(none)')[:1900]}\n"
+            f"Added: {(added or '(none)')[:1900]}"
+            "\n[Diff truncated; open the page for more context.]"
+        )
+    else:
+        change = diff[:4000]
+    if not oversized and len(diff) > 4000:
         change += "\n[Diff truncated; open the page for more context.]"
     message = EmailMessage()
     message["Subject"] = f"[PageWatch] {decision}: {target_id}"
@@ -288,10 +305,29 @@ def run(config_path, state_dir):
                     )
                 )
                 stage = "classify"
-                decision = classify_change(target_id, url, intent, diff)
+                diff_size = len(diff.encode("utf-8"))
+                oversized = diff_size > MAX_CLASSIFICATION_DIFF_BYTES
+                if oversized:
+                    decision = "REVIEW"
+                    reason = (
+                        "Automatic classification was skipped because the diff is "
+                        f"unusually large ({diff_size} bytes; "
+                        f"limit {MAX_CLASSIFICATION_DIFF_BYTES // 1024} KiB). "
+                        "Open the page and review the change manually."
+                    )
+                else:
+                    decision = classify_change(target_id, url, intent, diff)
+                    reason = None
                 if decision in {"NOTIFY", "REVIEW"}:
                     stage = "email"
-                    send_notification(target_id, url, decision, diff)
+                    send_notification(
+                        target_id,
+                        url,
+                        decision,
+                        diff,
+                        reason=reason,
+                        oversized=oversized,
+                    )
                 stage = "save state"
                 save_baseline(state_path, current)
                 print(f"{target_id}: {decision}")
