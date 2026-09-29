@@ -1,4 +1,5 @@
 import contextlib
+import difflib
 import json
 import tempfile
 import unittest
@@ -87,6 +88,89 @@ class CoreWatcherTests(unittest.TestCase):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
         notify.assert_not_called()
         self.assertEqual(baseline.read_text(encoding="utf-8"), "Newer\n")
+
+    def test_oversized_diff_reviews_only_after_email_succeeds(self):
+        self.assertEqual(pagewatch.MAX_CLASSIFICATION_DIFF_BYTES, 512 * 1024)
+        self.state_dir.mkdir()
+        baseline = self.state_dir / "course.txt"
+        baseline.write_text("Old\n", encoding="utf-8")
+        normal_text = "N" * 20_000
+        oversized_text = "X" * (pagewatch.MAX_CLASSIFICATION_DIFF_BYTES + 1)
+        settings = {
+            "SMTP_HOST": "smtp.example.com",
+            "SMTP_USERNAME": "account@example.com",
+            "SMTP_PASSWORD": "test-secret",
+            "SMTP_FROM": "watcher@example.com",
+            "SMTP_TO": "reader@example.com",
+        }
+        with (
+            patch.dict(pagewatch.os.environ, settings, clear=True),
+            patch.object(pagewatch.smtplib, "SMTP") as smtp,
+        ):
+            with (
+                patch.object(
+                    pagewatch, "fetch_page", return_value=f"<p>{normal_text}</p>"
+                ),
+                patch.object(
+                    pagewatch, "classify_change", return_value="IGNORE"
+                ) as classify,
+                contextlib.redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
+            classify.assert_called_once()
+            self.assertIn(normal_text, classify.call_args.args[3])
+            self.assertLessEqual(
+                len(classify.call_args.args[3].encode("utf-8")),
+                pagewatch.MAX_CLASSIFICATION_DIFF_BYTES,
+            )
+            smtp.assert_not_called()
+            self.assertEqual(baseline.read_text(encoding="utf-8"), normal_text + "\n")
+
+            server = smtp.return_value.__enter__.return_value
+            server.send_message.side_effect = OSError("SMTP failed")
+            error = StringIO()
+            with (
+                patch.object(
+                    pagewatch, "fetch_page", return_value=f"<p>{oversized_text}</p>"
+                ),
+                patch.object(pagewatch, "classify_change") as classify,
+            ):
+                with contextlib.redirect_stderr(error):
+                    self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
+                classify.assert_not_called()
+                self.assertIn("course [email]: OSError: SMTP failed", error.getvalue())
+                self.assertEqual(
+                    baseline.read_text(encoding="utf-8"), normal_text + "\n"
+                )
+
+                expected_diff = "".join(
+                    difflib.unified_diff(
+                        (normal_text + "\n").splitlines(keepends=True),
+                        (oversized_text + "\n").splitlines(keepends=True),
+                        fromfile="course: previous",
+                        tofile="course: current",
+                    )
+                )
+                body = server.send_message.call_args.args[0].get_content()
+                self.assertIn("Target: course", body)
+                self.assertIn("URL: https://example.com/course", body)
+                self.assertIn("Decision: REVIEW", body)
+                self.assertIn(f"{len(expected_diff.encode('utf-8'))} bytes", body)
+                self.assertIn("limit 512 KiB", body)
+                self.assertIn("Automatic classification was skipped", body)
+                self.assertIn("Open the page and review the change manually", body)
+                self.assertIn("Removed: " + normal_text[:100], body)
+                self.assertIn("Added: " + oversized_text[:100], body)
+                self.assertIn("[Diff truncated; open the page", body)
+                self.assertLess(len(body), 5_000)
+
+                server.send_message.side_effect = None
+                with contextlib.redirect_stdout(StringIO()):
+                    self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
+                classify.assert_not_called()
+                self.assertEqual(
+                    baseline.read_text(encoding="utf-8"), oversized_text + "\n"
+                )
 
     def test_notification_failure_preserves_state_and_other_target_runs(self):
         self.config.write_text(
