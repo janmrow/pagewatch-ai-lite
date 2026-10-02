@@ -38,7 +38,12 @@ class CoreWatcherTests(unittest.TestCase):
         notify.assert_not_called()
         baseline = self.state_dir / "course.txt"
         self.assertEqual(baseline.read_text(encoding="utf-8"), "Places open\n")
-        self.assertEqual(output.getvalue(), "course: baseline saved\n")
+        self.assertEqual(
+            output.getvalue(),
+            "course: baseline saved\n"
+            "summary: checked=1 changed=0 ai=0 notified=0 review=0 failed=0\n"
+            "summary: checked=1 changed=0 ai=0 notified=0 review=0 failed=0\n",
+        )
 
         output = StringIO()
         with (
@@ -61,32 +66,48 @@ class CoreWatcherTests(unittest.TestCase):
             ("course", "https://example.com/course", "NOTIFY"),
         )
         self.assertEqual(notify.call_args.args[3], classify.call_args.args[3])
-        self.assertIn("course: NOTIFY", output.getvalue())
+        self.assertEqual(
+            output.getvalue(),
+            "course: NOTIFY\n"
+            "summary: checked=1 changed=1 ai=1 notified=1 review=0 failed=0\n",
+        )
         self.assertEqual(baseline.read_text(encoding="utf-8"), "Places closed\n")
 
     def test_review_and_ignore_update_state(self):
         self.state_dir.mkdir()
         baseline = self.state_dir / "course.txt"
         baseline.write_text("Old\n", encoding="utf-8")
+        output = StringIO()
         with (
             patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
             patch.object(pagewatch, "classify_change", return_value="REVIEW"),
             patch.object(pagewatch, "send_notification") as notify,
-            contextlib.redirect_stdout(StringIO()),
+            contextlib.redirect_stdout(output),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
         notify.assert_called_once()
         self.assertEqual(notify.call_args.args[2], "REVIEW")
+        self.assertEqual(
+            output.getvalue(),
+            "course: REVIEW\n"
+            "summary: checked=1 changed=1 ai=1 notified=1 review=1 failed=0\n",
+        )
         self.assertEqual(baseline.read_text(encoding="utf-8"), "New\n")
 
+        output = StringIO()
         with (
             patch.object(pagewatch, "fetch_page", return_value="<p>Newer</p>"),
             patch.object(pagewatch, "classify_change", return_value="IGNORE"),
             patch.object(pagewatch, "send_notification") as notify,
-            contextlib.redirect_stdout(StringIO()),
+            contextlib.redirect_stdout(output),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
         notify.assert_not_called()
+        self.assertEqual(
+            output.getvalue(),
+            "course: IGNORE\n"
+            "summary: checked=1 changed=1 ai=1 notified=0 review=0 failed=0\n",
+        )
         self.assertEqual(baseline.read_text(encoding="utf-8"), "Newer\n")
 
     def test_oversized_diff_reviews_only_after_email_succeeds(self):
@@ -129,16 +150,24 @@ class CoreWatcherTests(unittest.TestCase):
             server = smtp.return_value.__enter__.return_value
             server.send_message.side_effect = OSError("SMTP failed")
             error = StringIO()
+            output = StringIO()
             with (
                 patch.object(
                     pagewatch, "fetch_page", return_value=f"<p>{oversized_text}</p>"
                 ),
                 patch.object(pagewatch, "classify_change") as classify,
             ):
-                with contextlib.redirect_stderr(error):
+                with (
+                    contextlib.redirect_stderr(error),
+                    contextlib.redirect_stdout(output),
+                ):
                     self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
                 classify.assert_not_called()
                 self.assertIn("course [email]: OSError: SMTP failed", error.getvalue())
+                self.assertEqual(
+                    output.getvalue(),
+                    "summary: checked=1 changed=1 ai=0 notified=0 review=1 failed=1\n",
+                )
                 self.assertEqual(
                     baseline.read_text(encoding="utf-8"), normal_text + "\n"
                 )
@@ -169,9 +198,15 @@ class CoreWatcherTests(unittest.TestCase):
                 self.assertLess(len(body), 5_000)
 
                 server.send_message.side_effect = None
-                with contextlib.redirect_stdout(StringIO()):
+                output = StringIO()
+                with contextlib.redirect_stdout(output):
                     self.assertEqual(pagewatch.run(self.config, self.state_dir), 0)
                 classify.assert_not_called()
+                self.assertEqual(
+                    output.getvalue(),
+                    "course: REVIEW\n"
+                    "summary: checked=1 changed=1 ai=0 notified=1 review=1 failed=0\n",
+                )
                 self.assertEqual(
                     baseline.read_text(encoding="utf-8"), oversized_text + "\n"
                 )
@@ -188,6 +223,7 @@ class CoreWatcherTests(unittest.TestCase):
         (self.state_dir / "first.txt").write_text("Old\n", encoding="utf-8")
         (self.state_dir / "second.txt").write_text("Old\n", encoding="utf-8")
         error = StringIO()
+        output = StringIO()
         with (
             patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
             patch.object(pagewatch, "classify_change", return_value="NOTIFY"),
@@ -196,18 +232,47 @@ class CoreWatcherTests(unittest.TestCase):
                 "send_notification",
                 side_effect=[OSError("SMTP failed"), None],
             ) as notify,
-            contextlib.redirect_stdout(StringIO()),
+            contextlib.redirect_stdout(output),
             contextlib.redirect_stderr(error),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
         self.assertEqual(notify.call_count, 2)
         self.assertIn("first [email]: OSError: SMTP failed", error.getvalue())
         self.assertEqual(
+            output.getvalue(),
+            "second: NOTIFY\n"
+            "summary: checked=2 changed=2 ai=2 notified=1 review=0 failed=1\n",
+        )
+        self.assertEqual(
             (self.state_dir / "first.txt").read_text(encoding="utf-8"), "Old\n"
         )
         self.assertEqual(
             (self.state_dir / "second.txt").read_text(encoding="utf-8"), "New\n"
         )
+
+    def test_review_email_failure_counts_review_without_notification(self):
+        self.state_dir.mkdir()
+        baseline = self.state_dir / "course.txt"
+        baseline.write_text("Old\n", encoding="utf-8")
+        output = StringIO()
+        error = StringIO()
+        with (
+            patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
+            patch.object(pagewatch, "classify_change", return_value="REVIEW"),
+            patch.object(
+                pagewatch, "send_notification", side_effect=OSError("SMTP failed")
+            ) as notify,
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(error),
+        ):
+            self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
+        notify.assert_called_once()
+        self.assertIn("course [email]: OSError: SMTP failed", error.getvalue())
+        self.assertEqual(
+            output.getvalue(),
+            "summary: checked=1 changed=1 ai=1 notified=0 review=1 failed=1\n",
+        )
+        self.assertEqual(baseline.read_text(encoding="utf-8"), "Old\n")
 
     def test_classification_failure_preserves_state(self):
         self.state_dir.mkdir()
@@ -216,14 +281,22 @@ class CoreWatcherTests(unittest.TestCase):
         for failure in (ValueError("bad reply"), TimeoutError("LLM timed out")):
             with self.subTest(failure=type(failure).__name__):
                 error = StringIO()
+                output = StringIO()
                 with (
                     patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
                     patch.object(pagewatch, "classify_change", side_effect=failure),
+                    patch.object(pagewatch, "send_notification") as notify,
                     contextlib.redirect_stderr(error),
+                    contextlib.redirect_stdout(output),
                 ):
                     self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
+                notify.assert_not_called()
                 self.assertIn(
                     f"course [classify]: {type(failure).__name__}", error.getvalue()
+                )
+                self.assertEqual(
+                    output.getvalue(),
+                    "summary: checked=1 changed=1 ai=1 notified=0 review=0 failed=1\n",
                 )
                 self.assertEqual(baseline.read_text(encoding="utf-8"), "Old\n")
 
@@ -244,13 +317,19 @@ class CoreWatcherTests(unittest.TestCase):
             return "<p>Working</p>"
 
         error = StringIO()
+        output = StringIO()
         with (
             patch.object(pagewatch, "fetch_page", side_effect=fetch),
-            contextlib.redirect_stdout(StringIO()),
+            contextlib.redirect_stdout(output),
             contextlib.redirect_stderr(error),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
         self.assertIn("broken [fetch]: TimeoutError: fetch timed out", error.getvalue())
+        self.assertEqual(
+            output.getvalue(),
+            "working: baseline saved\n"
+            "summary: checked=1 changed=0 ai=0 notified=0 review=0 failed=1\n",
+        )
         self.assertEqual(
             (self.state_dir / "broken.txt").read_text(encoding="utf-8"), "Known good\n"
         )
@@ -567,6 +646,7 @@ class CoreWatcherTests(unittest.TestCase):
         baseline = self.state_dir / "course.txt"
         baseline.write_text("Known good\n", encoding="utf-8")
         error = StringIO()
+        output = StringIO()
         with (
             patch.object(pagewatch, "fetch_page", return_value="<p>New</p>"),
             patch.object(pagewatch, "classify_change", return_value="NOTIFY"),
@@ -575,10 +655,15 @@ class CoreWatcherTests(unittest.TestCase):
                 pagewatch.os, "replace", side_effect=OSError("replace failed")
             ),
             contextlib.redirect_stderr(error),
+            contextlib.redirect_stdout(output),
         ):
             self.assertEqual(pagewatch.run(self.config, self.state_dir), 1)
         notify.assert_called_once()
         self.assertIn("course [save state]: OSError: replace failed", error.getvalue())
+        self.assertEqual(
+            output.getvalue(),
+            "summary: checked=1 changed=1 ai=1 notified=1 review=0 failed=1\n",
+        )
         self.assertEqual(baseline.read_text(encoding="utf-8"), "Known good\n")
         self.assertEqual(list(self.state_dir.iterdir()), [baseline])
 

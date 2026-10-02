@@ -348,13 +348,14 @@ def save_baseline(path, content):
 
 def run(config_path, state_dir):
     targets = load_targets(config_path)
-    failed = False
+    checked = changed = ai = notified = review = failed = 0
     for target_id, url, intent in targets:
         stage = "fetch"
         try:
             page = fetch_page(url)
             stage = "normalize"
             current = normalize_text(page)
+            checked += 1
             state_path = state_dir / f"{target_id}.txt"
             stage = "read state"
             try:
@@ -365,6 +366,7 @@ def run(config_path, state_dir):
                 print(f"{target_id}: baseline saved")
                 continue
             if current != previous:
+                changed += 1
                 stage = "diff"
                 diff = "".join(
                     difflib.unified_diff(
@@ -386,8 +388,11 @@ def run(config_path, state_dir):
                         "Open the page and review the change manually."
                     )
                 else:
+                    ai += 1
                     decision = classify_change(target_id, url, intent, diff)
                     reason = None
+                if decision == "REVIEW":
+                    review += 1
                 if decision in {"NOTIFY", "REVIEW"}:
                     stage = "email"
                     send_notification(
@@ -398,14 +403,19 @@ def run(config_path, state_dir):
                         reason=reason,
                         oversized=oversized,
                     )
+                    notified += 1
                 stage = "save state"
                 save_baseline(state_path, current)
                 print(f"{target_id}: {decision}")
         except Exception as exc:
-            failed = True
+            failed += 1
             print(
                 f"{target_id} [{stage}]: {type(exc).__name__}: {exc}", file=sys.stderr
             )
+    print(
+        f"summary: checked={checked} changed={changed} ai={ai} "
+        f"notified={notified} review={review} failed={failed}"
+    )
     return 1 if failed else 0
 
 
