@@ -151,17 +151,21 @@ class CoreWatcherTests(unittest.TestCase):
                         tofile="course: current",
                     )
                 )
-                body = server.send_message.call_args.args[0].get_content()
+                message = server.send_message.call_args.args[0]
+                self.assertEqual(message["Subject"], "[PageWatch] REVIEW: course")
+                body = message.get_content()
                 self.assertIn("Target: course", body)
-                self.assertIn("URL: https://example.com/course", body)
-                self.assertIn("Decision: REVIEW", body)
+                self.assertIn("Page:\nhttps://example.com/course", body)
+                self.assertIn("Note:\nAutomatic classification was skipped", body)
                 self.assertIn(f"{len(expected_diff.encode('utf-8'))} bytes", body)
                 self.assertIn("limit 512 KiB", body)
                 self.assertIn("Automatic classification was skipped", body)
                 self.assertIn("Open the page and review the change manually", body)
-                self.assertIn("Removed: " + normal_text[:100], body)
-                self.assertIn("Added: " + oversized_text[:100], body)
-                self.assertIn("[Diff truncated; open the page", body)
+                self.assertIn("Before:\n" + normal_text[:100], body)
+                self.assertIn("Now:\n" + oversized_text[:100], body)
+                self.assertIn("[Change details truncated; open the page", body)
+                self.assertNotIn("@@ ", body)
+                self.assertNotIn("Reason:", body)
                 self.assertLess(len(body), 5_000)
 
                 server.send_message.side_effect = None
@@ -407,11 +411,19 @@ class CoreWatcherTests(unittest.TestCase):
             patch.dict(pagewatch.os.environ, settings, clear=True),
             patch.object(pagewatch.smtplib, "SMTP") as smtp,
         ):
+            diff = "".join(
+                difflib.unified_diff(
+                    ["Course\n", "Places closed\n", "Apply today\n"],
+                    ["Course\n", "Places open\n", "Apply today\n"],
+                    fromfile="course: previous",
+                    tofile="course: current",
+                )
+            )
             pagewatch.send_notification(
                 "course",
                 "https://example.com/course",
                 "NOTIFY",
-                "+New places available\n" + "x" * 5000,
+                diff,
             )
         smtp.assert_called_once_with("smtp.example.com", 587, timeout=15)
         server = smtp.return_value.__enter__.return_value
@@ -424,11 +436,101 @@ class CoreWatcherTests(unittest.TestCase):
         self.assertEqual(message["From"], "watcher@example.com")
         self.assertEqual(message["To"], "reader@example.com")
         body = message.get_content()
-        self.assertIn("URL: https://example.com/course", body)
-        self.assertIn("Decision: NOTIFY", body)
-        self.assertIn("Reason: The change appears relevant", body)
-        self.assertIn("+New places available", body)
-        self.assertIn("[Diff truncated; open the page", body)
+        self.assertIn("Target: course", body)
+        self.assertIn("Page:\nhttps://example.com/course", body)
+        self.assertIn("Before:\nPlaces closed", body)
+        self.assertIn("Now:\nPlaces open", body)
+        self.assertIn("Context:\nCourse\nApply today", body)
+        self.assertNotIn("Reason:", body)
+        self.assertNotIn("--- ", body)
+        self.assertNotIn("+++ ", body)
+        self.assertNotIn("@@ ", body)
+        self.assertNotIn("-Places closed", body)
+        self.assertNotIn("+Places open", body)
+
+    def test_change_details_for_addition_removal_and_multiple_hunks(self):
+        addition = "".join(
+            difflib.unified_diff(["Course\n"], ["Course\n", "Places open\n"])
+        )
+        details = pagewatch.format_change_details(addition)
+        self.assertIn("Added:\nPlaces open", details)
+        self.assertIn("Context:\nCourse", details)
+        self.assertNotIn("Before:", details)
+        self.assertNotIn("Change 1", details)
+
+        removal = "".join(
+            difflib.unified_diff(["Course\n", "Places closed\n"], ["Course\n"])
+        )
+        details = pagewatch.format_change_details(removal)
+        self.assertIn("Removed:\nPlaces closed", details)
+        self.assertNotIn("Now:", details)
+
+        previous = [f"Line {number}\n" for number in range(20)]
+        current = previous.copy()
+        current[1] = "First change\n"
+        current[18] = "Second change\n"
+        details = pagewatch.format_change_details(
+            "".join(difflib.unified_diff(previous, current))
+        )
+        self.assertIn("Change 1\n\nBefore:\nLine 1\n\nNow:\nFirst change", details)
+        self.assertIn("Change 2\n\nBefore:\nLine 18\n\nNow:\nSecond change", details)
+        self.assertLess(details.index("Change 1"), details.index("Change 2"))
+
+    def test_independent_edits_within_one_hunk_remain_separate(self):
+        previous = [
+            "Course\n",
+            "old application notice\n",
+            "context one\n",
+            "context two\n",
+            "context three\n",
+            "context four\n",
+            "End\n",
+        ]
+        current = [
+            "Course\n",
+            "context one\n",
+            "context two\n",
+            "context three\n",
+            "context four\n",
+            "new tuition notice\n",
+            "End\n",
+        ]
+        diff = "".join(difflib.unified_diff(previous, current))
+        self.assertEqual(diff.count("\n@@ "), 1)
+        details = pagewatch.format_change_details(diff)
+        self.assertIn("Change 1\n\nRemoved:\nold application notice", details)
+        self.assertIn("Change 2\n\nAdded:\nnew tuition notice", details)
+        self.assertIn("Context:\nCourse\ncontext one", details)
+        self.assertIn("Context:\ncontext four\nEnd", details)
+        self.assertNotIn("Before:", details)
+        self.assertNotIn("Now:", details)
+
+    def test_long_replacement_exposes_difference_near_end(self):
+        shared_prefix = "A" * 2500
+        diff = "".join(
+            difflib.unified_diff(
+                [shared_prefix + "APPLICATION CLOSED\n"],
+                [shared_prefix + "APPLICATION OPEN\n"],
+            )
+        )
+        details = pagewatch.format_change_details(diff)
+        before, now = details.split("\n\nNow:\n", 1)
+        self.assertIn("Before:\n…", before)
+        self.assertIn("APPLICATION CLOSED", before)
+        self.assertTrue(now.startswith("…"))
+        self.assertIn("APPLICATION OPEN", now)
+        self.assertIn("[Change details truncated; open the page", details)
+        self.assertLess(len(details), 4_100)
+
+    def test_change_details_are_bounded_with_explicit_truncation(self):
+        diff = "".join(
+            difflib.unified_diff(["A" * 20_000 + "\n"], ["B" * 20_000 + "\n"])
+        )
+        details = pagewatch.format_change_details(diff)
+        self.assertIn("Before:\n" + "A" * 100, details)
+        self.assertIn("Now:\n" + "B" * 100, details)
+        self.assertIn("[Change details truncated; open the page", details)
+        self.assertLess(len(details), 4_100)
 
     def test_main_loads_local_env_without_overriding_shell(self):
         (self.root / ".env").write_text(

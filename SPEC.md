@@ -172,8 +172,9 @@ A notification should contain:
 - target,
 - URL,
 - decision,
-- short reason,
-- relevant change.
+- relevant human-readable change.
+
+Include a short explanatory note only when it adds real system information. For an oversized diff, explain that automatic classification was skipped, give the actual diff size and configured 512 KiB limit, and request manual review.
 
 ---
 

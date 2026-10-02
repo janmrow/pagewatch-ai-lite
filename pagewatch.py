@@ -2,6 +2,7 @@
 
 import argparse
 import difflib
+import io
 import json
 import os
 import re
@@ -47,6 +48,8 @@ MAX_PAGE_BYTES = 5_000_000
 MAX_CLASSIFICATION_DIFF_BYTES = 512 * 1024
 CONSOLE_URL = "https://opencode.ai/inference/openai/v1/chat/completions"
 DECISIONS = {"NOTIFY", "IGNORE", "REVIEW"}
+MAX_EMAIL_CHANGE_CHARS = 4000
+TRUNCATED_CHANGE_NOTE = "[Change details truncated; open the page for more context.]"
 
 
 class TextExtractor(HTMLParser):
@@ -205,6 +208,95 @@ def classify_change(target_id, url, intent, diff):
     return decision.strip()
 
 
+def format_change_details(diff):
+    """Show changed lines and nearby context from the existing unified diff."""
+    changes = []
+    removed, added = [], []
+    before_context = None
+    in_hunk = truncated = False
+    detail_length = 0
+
+    def finish_change(after_context=None):
+        nonlocal detail_length, truncated
+        if not removed and not added:
+            return
+        before = "\n".join(removed)
+        now = "\n".join(added)
+        excerpt_start = 0
+        if before and now:
+            for left, right in zip(before, now):
+                if left != right:
+                    break
+                excerpt_start += 1
+            excerpt_start = max(0, excerpt_start - 80)
+
+        parts = []
+        for label, content in (
+            ("Before" if now else "Removed", before),
+            ("Now" if before else "Added", now),
+        ):
+            if not content:
+                continue
+            if len(content) > 1800:
+                start = excerpt_start if before and now else 0
+                end = min(len(content), start + 1800)
+                content = (
+                    ("…" if start else "")
+                    + content[start:end]
+                    + ("…" if end < len(content) else "")
+                )
+                truncated = True
+            parts.append(f"{label}:\n{content}")
+        context = [line for line in (before_context, after_context) if line is not None]
+        if context:
+            parts.append("Context:\n" + "\n".join(line for line, _ in context))
+            truncated |= any(clipped for _, clipped in context)
+        change = "\n\n".join(parts)
+        detail_length += len(change) + (3 if changes else 0)
+        changes.append(change)
+        truncated |= detail_length > MAX_EMAIL_CHANGE_CHARS
+        removed.clear()
+        added.clear()
+
+    for line in io.StringIO(diff):
+        if line.startswith("@@ "):
+            if in_hunk:
+                finish_change()
+                if detail_length > MAX_EMAIL_CHANGE_CHARS:
+                    in_hunk = False
+                    break
+            in_hunk = True
+            before_context = None
+            continue
+        if not in_hunk or not line or line[0] not in " +-":
+            continue
+        content = line[1:].rstrip("\r\n")
+        if line[0] == " ":
+            nearby = (content[:160], len(content) > 160)
+            finish_change(nearby)
+            if detail_length > MAX_EMAIL_CHANGE_CHARS:
+                in_hunk = False
+                break
+            before_context = nearby
+        elif line[0] == "-":
+            removed.append(content)
+        else:
+            added.append(content)
+    if in_hunk:
+        finish_change()
+
+    details = "\n\n\n".join(
+        f"Change {number}\n\n{change}" if len(changes) > 1 else change
+        for number, change in enumerate(changes, 1)
+    )
+    if len(details) > MAX_EMAIL_CHANGE_CHARS:
+        details = details[:MAX_EMAIL_CHANGE_CHARS].rstrip()
+        truncated = True
+    if truncated:
+        details += "\n\n" + TRUNCATED_CHANGE_NOTE
+    return details
+
+
 def send_notification(target_id, url, decision, diff, *, reason=None, oversized=False):
     settings = {
         name: os.environ.get(name, "").strip()
@@ -226,36 +318,14 @@ def send_notification(target_id, url, decision, diff, *, reason=None, oversized=
     if not 1 <= port <= 65535:
         raise ValueError("SMTP_PORT must be between 1 and 65535")
 
-    if reason is None:
-        reason = {
-            "NOTIFY": "The change appears relevant to your intent.",
-            "REVIEW": "The change may be relevant and needs your review.",
-        }[decision]
-    if oversized:
-        removed = added = None
-        for line in diff.splitlines():
-            if line.startswith("-") and not line.startswith("--- ") and removed is None:
-                removed = line[1:]
-            elif line.startswith("+") and not line.startswith("+++ ") and added is None:
-                added = line[1:]
-            if removed is not None and added is not None:
-                break
-        change = (
-            f"Removed: {(removed or '(none)')[:1900]}\n"
-            f"Added: {(added or '(none)')[:1900]}"
-            "\n[Diff truncated; open the page for more context.]"
-        )
-    else:
-        change = diff[:4000]
-    if not oversized and len(diff) > 4000:
-        change += "\n[Diff truncated; open the page for more context.]"
+    change = format_change_details(diff)
     message = EmailMessage()
     message["Subject"] = f"[PageWatch] {decision}: {target_id}"
     message["From"] = settings["SMTP_FROM"]
     message["To"] = settings["SMTP_TO"]
+    note = f"\n\nNote:\n{reason}" if oversized and reason else ""
     message.set_content(
-        f"Target: {target_id}\nURL: {url}\nDecision: {decision}\n"
-        f"Reason: {reason}\n\nChange:\n{change}"
+        f"Target: {target_id}{note}\n\nWhat changed\n\n{change}\n\nPage:\n{url}"
     )
 
     with smtplib.SMTP(settings["SMTP_HOST"], port, timeout=15) as server:
